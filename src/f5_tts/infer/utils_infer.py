@@ -20,7 +20,6 @@ import numpy as np
 import torch
 import torchaudio
 import tqdm
-from huggingface_hub import snapshot_download, hf_hub_download
 from pydub import AudioSegment, silence
 from transformers import pipeline
 from vocos import Vocos
@@ -143,18 +142,13 @@ def chunk_text(text, max_chars=135):
 
 
 # load vocoder
-def load_vocoder(vocoder_name="vocos", is_local=False, local_path="", device=device, hf_cache_dir=None):
+def load_vocoder(vocoder_name="vocos", is_local=True, local_path="ckpts/vocos", device=device, hf_cache_dir=None):
     if vocoder_name == "vocos":
         # vocoder = Vocos.from_pretrained("charactr/vocos-mel-24khz").to(device)
         if is_local:
             print(f"Load vocos from local path {local_path}")
             config_path = f"{local_path}/config.yaml"
             model_path = f"{local_path}/pytorch_model.bin"
-        else:
-            print("Download Vocos from huggingface charactr/vocos-mel-24khz")
-            repo_id = "charactr/vocos-mel-24khz"
-            config_path = hf_hub_download(repo_id=repo_id, cache_dir=hf_cache_dir, filename="config.yaml")
-            model_path = hf_hub_download(repo_id=repo_id, cache_dir=hf_cache_dir, filename="pytorch_model.bin")
         vocoder = Vocos.from_hparams(config_path)
         state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
         from vocos.feature_extractors import EncodecFeatures
@@ -166,20 +160,6 @@ def load_vocoder(vocoder_name="vocos", is_local=False, local_path="", device=dev
             }
             state_dict.update(encodec_parameters)
         vocoder.load_state_dict(state_dict)
-        vocoder = vocoder.eval().to(device)
-    elif vocoder_name == "bigvgan":
-        try:
-            from third_party.BigVGAN import bigvgan
-        except ImportError:
-            print("You need to follow the README to init submodule and change the BigVGAN source code.")
-        if is_local:
-            """download from https://huggingface.co/nvidia/bigvgan_v2_24khz_100band_256x/tree/main"""
-            vocoder = bigvgan.BigVGAN.from_pretrained(local_path, use_cuda_kernel=False)
-        else:
-            local_path = snapshot_download(repo_id="nvidia/bigvgan_v2_24khz_100band_256x", cache_dir=hf_cache_dir)
-            vocoder = bigvgan.BigVGAN.from_pretrained(local_path, use_cuda_kernel=False)
-
-        vocoder.remove_weight_norm()
         vocoder = vocoder.eval().to(device)
     return vocoder
 
@@ -334,9 +314,43 @@ def remove_silence_edges(audio, silence_threshold=-42):
 # preprocess reference audio and text
 
 
-def apply_audio_processing(input_path, output_path=None, compression=True, loudnorm=True, rubberband=False, volume=-4):
+def apply_audio_processing(
+    input_path, 
+    output_path=None, 
+    compression=True,
+    compression_threshold=-15,
+    compression_ratio=2,
+    compression_attack=2000,
+    compression_release=3700,
+    compression_makeup=1,
+    loudnorm=True,
+    rubberband=False,
+    rubberband_transients=512,
+    rubberband_detector=2048,
+    rubberband_smoothing=8388608,
+    rubberband_window=2097152,
+    rubberband_pitchq=67108864,
+    volume=-4
+):
     """
     Apply audio compression using ffmpeg
+    Args:
+        input_path: Path to input audio file
+        output_path: Path to output audio file (optional)
+        compression: Whether to apply compression
+        compression_threshold: Compression threshold in dB
+        compression_ratio: Compression ratio
+        compression_attack: Attack time in microseconds
+        compression_release: Release time in microseconds
+        compression_makeup: Makeup gain
+        loudnorm: Whether to apply loudness normalization
+        rubberband: Whether to apply rubberband processing
+        rubberband_transients: Transients parameter for rubberband
+        rubberband_detector: Detector size for rubberband
+        rubberband_smoothing: Smoothing parameter for rubberband
+        rubberband_window: Window size for rubberband
+        rubberband_pitchq: Pitch quality for rubberband
+        volume: Volume adjustment in dB
     """
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
@@ -349,13 +363,17 @@ def apply_audio_processing(input_path, output_path=None, compression=True, loudn
         # Build filter chain properly
         filters = []
         if compression:
-            filters.append("acompressor=threshold=-15dB:ratio=2:attack=2000:release=3700:makeup=1")
+            filters.append(f"acompressor=threshold={compression_threshold}dB:ratio={compression_ratio}:"
+                         f"attack={compression_attack}:release={compression_release}:"
+                         f"makeup={compression_makeup}")
         if rubberband:
-            filters.append("rubberband=transients=512:detector=2048:smoothing=8388608:window=2097152:pitchq=67108864")
+            filters.append(f"rubberband=transients={rubberband_transients}:"
+                         f"detector={rubberband_detector}:smoothing={rubberband_smoothing}:"
+                         f"window={rubberband_window}:pitchq={rubberband_pitchq}")
         if loudnorm:
             filters.append("loudnorm")
 
-        filters.append("volume=" + str(volume) + "dB")
+        filters.append(f"volume={volume}dB")
 
         print(filters)
         
@@ -383,7 +401,27 @@ def apply_audio_processing(input_path, output_path=None, compression=True, loudn
         return False
 
 
-def preprocess_ref_audio_text(ref_audio_orig, ref_text, clip_short=True, show_info=print, device=device):
+def preprocess_ref_audio_text(
+    ref_audio_orig, 
+    ref_text, 
+    clip_short=True, 
+    show_info=print, 
+    device=device,
+    compression=True,
+    compression_threshold=-15,
+    compression_ratio=2,
+    compression_attack=2000,
+    compression_release=3700,
+    compression_makeup=1,
+    loudnorm=True,
+    rubberband=False,
+    rubberband_transients=512,
+    rubberband_detector=2048,
+    rubberband_smoothing=8388608,
+    rubberband_window=2097152,
+    rubberband_pitchq=67108864,
+    volume=-4
+):
     show_info("Converting audio...")
     temp_files = []  # Keep track of temp files
     try:
@@ -428,7 +466,24 @@ def preprocess_ref_audio_text(ref_audio_orig, ref_text, clip_short=True, show_in
             # Apply compression to reference audio and get the processed file
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as processed_f:
                 temp_files.append(processed_f.name)
-                apply_audio_processing(f.name, processed_f.name, compression=True, loudnorm=True, rubberband=False, volume=-3)
+                apply_audio_processing(
+                    f.name, 
+                    processed_f.name,
+                    compression=compression,
+                    compression_threshold=compression_threshold,
+                    compression_ratio=compression_ratio,
+                    compression_attack=compression_attack,
+                    compression_release=compression_release,
+                    compression_makeup=compression_makeup,
+                    loudnorm=loudnorm,
+                    rubberband=rubberband,
+                    rubberband_transients=rubberband_transients,
+                    rubberband_detector=rubberband_detector,
+                    rubberband_smoothing=rubberband_smoothing,
+                    rubberband_window=rubberband_window,
+                    rubberband_pitchq=rubberband_pitchq,
+                    volume=volume
+                )
                 ref_audio = processed_f.name
 
         # Compute a hash of the reference audio file
@@ -493,7 +548,21 @@ def infer_process(
     cfg_strength=cfg_strength,
     sway_sampling_coef=sway_sampling_coef,
     speed=speed,
-    device=device
+    device=device,
+    compression=True,
+    compression_threshold=-15,
+    compression_ratio=2,
+    compression_attack=2000,
+    compression_release=3700,
+    compression_makeup=1,
+    loudnorm=True,
+    rubberband=False,
+    rubberband_transients=512,
+    rubberband_detector=2048,
+    rubberband_smoothing=8388608,
+    rubberband_window=2097152,
+    rubberband_pitchq=67108864,
+    volume=-4
 ):
     
     ref_audio, ref_text = preprocess_ref_audio_text(ref_audio, ref_text, show_info=show_info, device=device)
@@ -529,7 +598,21 @@ def infer_process(
         sway_sampling_coef=sway_sampling_coef,
         speed=speed,
         device=device,
-        threshold=threshold
+        threshold=threshold,
+        compression=compression,
+        compression_threshold=compression_threshold,
+        compression_ratio=compression_ratio,
+        compression_attack=compression_attack,
+        compression_release=compression_release,
+        compression_makeup=compression_makeup,
+        loudnorm=loudnorm,
+        rubberband=rubberband,
+        rubberband_transients=rubberband_transients,
+        rubberband_detector=rubberband_detector,
+        rubberband_smoothing=rubberband_smoothing,
+        rubberband_window=rubberband_window,
+        rubberband_pitchq=rubberband_pitchq,
+        volume=-volume
     )
 
 
@@ -652,7 +735,21 @@ def infer_batch_process(
     cfg_strength=2.0,
     sway_sampling_coef=-1,
     speed=1,
-    device=None
+    device=None,
+    compression=True,
+    compression_threshold=-15,
+    compression_ratio=2,
+    compression_attack=2000,
+    compression_release=3700,
+    compression_makeup=1,
+    loudnorm=True,
+    rubberband=False,
+    rubberband_transients=512,
+    rubberband_detector=2048,
+    rubberband_smoothing=8388608,
+    rubberband_window=2097152,
+    rubberband_pitchq=67108864,
+    volume=-4
 ):
     temp_files = []  # Keep track of temp files
     try:
@@ -789,7 +886,24 @@ def infer_batch_process(
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as processed_f:
                 temp_files.append(processed_f.name)
                 # Apply audio processing
-                apply_audio_processing(temp_f.name, processed_f.name, compression=True, loudnorm=True, rubberband=True, volume=-4)
+                apply_audio_processing(
+                    temp_f.name, 
+                    processed_f.name,
+                    compression=compression,
+                    compression_threshold=compression_threshold,
+                    compression_ratio=compression_ratio,
+                    compression_attack=compression_attack,
+                    compression_release=compression_release,
+                    compression_makeup=compression_makeup,
+                    loudnorm=loudnorm,
+                    rubberband=rubberband,
+                    rubberband_transients=rubberband_transients,
+                    rubberband_detector=rubberband_detector,
+                    rubberband_smoothing=rubberband_smoothing,
+                    rubberband_window=rubberband_window,
+                    rubberband_pitchq=rubberband_pitchq,
+                    volume=-volume
+                )
                 # Load the processed audio
                 processed_wave, sr = torchaudio.load(processed_f.name)
                 final_wave_processed = processed_wave.squeeze().numpy()
